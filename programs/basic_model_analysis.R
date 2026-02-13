@@ -1,473 +1,805 @@
- 
+# =============================================================================
+# Platelet RNA-based classification of Glioblastoma (GBM) vs Healthy Controls
+# =============================================================================
+#
+# This script performs the TDEA (Threshold-Based Differential Expression Analysis)
+# with Elastic Net regularization pipeline described in Giczewska, Pastuszak et al.
+#
+# The analysis proceeds in three stages:
+#   1. Data loading, filtering, and sample exclusion
+#   2. Differential expression analysis on the training set to identify candidate genes
+#   3. Elastic Net classification (with secondary feature selection) followed by
+#      Gene Ontology and Reactome pathway enrichment of the final gene panel
+#
+# Input data:
+#   - DESeq2-normalized platelet RNA-seq counts (4,412 genes x 403 samples)
+#   - Sample metadata including patient group (GBM / HC), isolation site, etc.
+#   - Pre-defined train/test split IDs (60/40)
+#   - Ensembl 75 gene annotations
+#   - Reactome GMT gene set file (v2022.1)
+#
+# Output:
+#   - Confusion matrix plot (PDF) for the test set
+#   - Reactome and Gene Ontology enrichment bar plots (PDF)
+#   - Enrichment results table (XLSX)
+#   - Elastic Net model coefficients (saved as RData)
+# =============================================================================
+
 library(DESeq2)
 library(edgeR)
+
+# Flag to use the fixed train/test split from the manuscript (reproducibility).
+# When TRUE, sample IDs are read from file rather than generated via createFolds.
 useArticleSplit = T
+
+# --- 1. Load normalized counts and sample metadata ---
+
 countsAllDeseq = read.csv2("../data/rawdata/countsNormalized.tsv", sep = "\t")
 colnames(countsAllDeseq) = gsub(".", "-", colnames(countsAllDeseq), fixed = T)
-useArticleSplit = T
+
+# Ensure all columns are numeric (read.csv2 may import as character)
 for(i in 1:ncol(countsAllDeseq))
   countsAllDeseq[,i] = as.numeric(countsAllDeseq[,i])
-sampleInfoAll = read.csv2("../data/rawdata/sampleInfo.tsv", sep = "\t")
-load("../data/dgeGenesEnsembl75.RData")
-# rownames(epilepsyRaw) = epilepsyRaw$X1 
 
-normalizeDESeq2NoReport = function ( rawCounts )
-{
+sampleInfoAll = read.csv2("../data/rawdata/sampleInfo.tsv", sep = "\t")
+
+# Gene annotation table (Ensembl 75): maps HGNC symbols to Ensembl IDs
+load("../data/dgeGenesEnsembl75.RData")
+
+# =============================================================================
+# Helper functions
+# =============================================================================
+
+# DESeq2 variance-stabilizing normalization (standalone, without design contrast).
+# Used when re-normalizing raw counts outside the main pipeline.
+normalizeDESeq2NoReport = function(rawCounts) {
   library(DESeq2)
   
   d = rawCounts
   sampleIds = colnames(rawCounts)
-  condition <- factor(rep("A",dim(d)[2]))
+  # Single-group dummy design (normalization only, no DE testing)
+  condition <- factor(rep("A", dim(d)[2]))
   
   dds <- DESeqDataSetFromMatrix(countData = d, DataFrame(condition), design = ~ 1)
   dds <- DESeq(dds)
-  vsd <- varianceStabilizingTransformation(dds, blind=TRUE)
+  vsd <- varianceStabilizingTransformation(dds, blind = TRUE)
   
   logs_norm_arr_ord = assay(vsd)
-  return(logs_norm_arr_ord) 
+  return(logs_norm_arr_ord)
 }
 
-filter.for.platelet.transcriptome <- function(dge, 
+# Filter out low-abundance transcripts from a DGEList object.
+# Removes genes with fewer than `minimum.read.counts` reads in > 90% of samples.
+filter.for.platelet.transcriptome <- function(dge,
                                               minimum.read.counts = 30,
-                                              verbose = TRUE){
-  # Filters the DGE-object containing the raw data for low-abundant RNAs.
-  # 
-  # Args:
-  #   dge: DGEList outputted by the prepare.dge.object-function, contains raw count table,
-  #       sample info and gene info.
-  #   minimum.read.counts: Numeric-value containing the minimum number of gene counts to 
-  #       be detected in at least 90% of the samples.
-  #   verbose:  Whether or not to show function output.
-  #
-  # Returns:
-  #   DGEList with filtered count table, sample info table and gene info table.
-  
-  if (missing(dge)){
+                                              verbose = TRUE) {
+  if (missing(dge)) {
     stop("Provide DGElist object")
   }
   stopifnot(class(dge) == "DGEList")
   
-  if (!is.numeric(minimum.read.counts)){
+  if (!is.numeric(minimum.read.counts)) {
     stop("Provide numeric value for minimum.read.counts")
   }
   
-  # filter for low-abundant transcripts, 
-  # i.e. those transcripts with less than minimum.read.counts reads in more 
-  # than 90% of all s amples
-  bad.genes <- names(which(apply(dge$counts, 1, function(x){sum(x < minimum.read.counts)}) > 0.9 * ncol(dge)))
+  # Identify genes that fall below the read-count threshold in >90% of samples
+  bad.genes <- names(which(
+    apply(dge$counts, 1, function(x) { sum(x < minimum.read.counts) }) > 0.9 * ncol(dge)
+  ))
   dgeFiltered <- dge[which(!rownames(dge) %in% bad.genes), ]
   
-  if (verbose == TRUE){
+  if (verbose == TRUE) {
     print(paste("Number of transcripts detected: ", nrow(dgeFiltered$counts), sep = ""))
   }
   
-  # return DGEList-object
   return(dgeFiltered)
 }
 
-
-
-
-
-  
-
-
+# Safe wrappers for Wilcoxon and t-test that return NA on failure
+# (e.g., when all values in a group are identical)
 my.wilcox.p.value <- function(...) {
-  obj<-try(wilcox.test(...), silent=TRUE)
+  obj <- try(wilcox.test(...), silent = TRUE)
   if (is(obj, "try-error")) return(NA) else return(obj$p.value)
-} 
+}
 
 my.t.test.p.value <- function(...) {
-  obj<-try(t.test(...), silent=TRUE)
+  obj <- try(t.test(...), silent = TRUE)
   if (is(obj, "try-error")) return(NA) else return(obj$p.value)
-} 
+}
+
+# =============================================================================
+# 2. Sample exclusion and cohort definition
+# =============================================================================
 
 library(matrixStats)
 dataFiltered = countsAllDeseq
-# not IDH wildtype, excluded as non GBM according to new classification
-id604 = grep("TR3712-GBM-VUMC", sampleInfoAll$id, fixed = T)  
-if(length(id604) > 0)
-{ 
+
+# Exclude one IDH-mutant sample reclassified as non-GBM under updated WHO criteria.
+# TR3712-GBM-VUMC was originally labeled GBM but is IDH-wildtype negative.
+id604 = grep("TR3712-GBM-VUMC", sampleInfoAll$id, fixed = T)
+if(length(id604) > 0) {
   dataFiltered = dataFiltered[, -id604]
   sampleInfoAll = sampleInfoAll[-id604, ]
-} 
+}
 
-genes = genes[which(!is.na(match(genes$hgnc_symbol, rownames(dataFiltered)))),] 
+# Align gene annotation table to the genes present in filtered counts
+genes = genes[which(!is.na(match(genes$hgnc_symbol, rownames(dataFiltered)))),]
 rownames(genes) = genes$hgnc_symbol
-library(readxl)  
+
+# =============================================================================
+# Differential expression summary table (Wilcoxon rank-sum test + FDR)
+# =============================================================================
+#
+# For two patient groups (groupA vs groupB), computes per-gene:
+#   - Mean and median expression in each group
+#   - Fold change (on log2 scale, back-transformed to linear)
+#   - Wilcoxon rank-sum p-value with FDR correction
+#
+# When `all = FALSE` (default), applies TDEA thresholds:
+#   - FDR q-value < 0.1
+#   - Fold change > 1.3 or < 1/1.3
+#   - At least one group median > 3 (low-expression filter)
+
 getSummaryTable = function(dataFiltered, sampleInfo, groupA, groupB,
-                           all = F)
-{ 
+                           all = F) {
   hcId = which(sampleInfo$ori_patientgroup == groupA)
-  ocId =  which(sampleInfo$ori_patientgroup == groupB)
+  ocId = which(sampleInfo$ori_patientgroup == groupB)
   logsBenign = dataFiltered[, hcId]
-  logsMalignant = dataFiltered[,ocId]
-   
+  logsMalignant = dataFiltered[, ocId]
+  
+  # Group-level summary statistics
   meanBenign <- rowMeans(logsBenign)
   meanMalignant <- rowMeans(logsMalignant)
   
   medianBenign <- rowMedians(as.matrix(logsBenign))
-  medianMalignant <-  rowMedians(as.matrix(logsMalignant))
-  folds_mean_Benign_Malignant = 2^(meanBenign - meanMalignant)  
-  ttest_Benign_Malignant_pvalue = sapply(1:nrow(logsBenign), function(i)
-    my.t.test.p.value(logsBenign[i, ], logsMalignant[i, ]))
-  ttest_Benign_Malignant_pvalue = sapply(1:nrow(logsBenign), function(i)
-    my.wilcox.p.value(unlist(logsBenign[i, ]), unlist(logsMalignant[i, ]))) 
-  genesLocal = genes[rownames(dataFiltered),] 
-  fdrt_Benign_Malignant_qvalue = p.adjust(ttest_Benign_Malignant_pvalue, method = "fdr", n = length(ttest_Benign_Malignant_pvalue))
-  summary_table_Benign_Malignant = cbind.data.frame( genesLocal$ensembl_gene_id
-                                                     ,rownames(logsBenign),
-                                                    meanBenign, meanMalignant,
-                                                    medianBenign, medianMalignant, folds_mean_Benign_Malignant,
-                                                    ttest_Benign_Malignant_pvalue, fdrt_Benign_Malignant_qvalue, 
-                                                    genesLocal$description 
+  medianMalignant <- rowMedians(as.matrix(logsMalignant))
+  
+  # Fold change computed from mean log2-scale values (DESeq2-normalized)
+  folds_mean_Benign_Malignant = 2^(meanBenign - meanMalignant)
+  
+  # Per-gene Wilcoxon rank-sum test between the two groups
+  wilcox_Benign_Malignant_pvalue = sapply(1:nrow(logsBenign), function(i)
+    my.wilcox.p.value(unlist(logsBenign[i, ]), unlist(logsMalignant[i, ])))
+  
+  genesLocal = genes[rownames(dataFiltered),]
+  
+  # FDR correction (Benjamini-Hochberg)
+  fdr_Benign_Malignant_qvalue = p.adjust(
+    wilcox_Benign_Malignant_pvalue, method = "fdr",
+    n = length(wilcox_Benign_Malignant_pvalue)
+  )
+  
+  # Assemble results table
+  summary_table_Benign_Malignant = cbind.data.frame(
+    genesLocal$ensembl_gene_id,
+    rownames(logsBenign),
+    meanBenign, meanMalignant,
+    medianBenign, medianMalignant,
+    folds_mean_Benign_Malignant,
+    wilcox_Benign_Malignant_pvalue,
+    fdr_Benign_Malignant_qvalue,
+    genesLocal$description
   )
   
   groupNameA = groupA
   groupNameB = groupB
-  tableCols_Benign_Malignant=  cbind( "ENSG","Gene",paste("Mean ", groupNameA, sep = ""), paste("Mean ", groupNameB, sep = ""),
-                                      paste("Median ", groupNameA, sep = ""), paste("Median ", groupNameB, sep = ""),
-                                      paste("Mean fold change ", groupNameA, "-", groupNameB, sep = ""),
-                                      "T-test p-value ",
-                                      "FDR q-value ", 
-                                      "Description" 
-  ) 
+  tableCols_Benign_Malignant = cbind(
+    "ENSG", "Gene",
+    paste("Mean ", groupNameA, sep = ""), paste("Mean ", groupNameB, sep = ""),
+    paste("Median ", groupNameA, sep = ""), paste("Median ", groupNameB, sep = ""),
+    paste("Mean fold change ", groupNameA, "-", groupNameB, sep = ""),
+    "Wilcoxon p-value ",
+    "FDR q-value ",
+    "Description"
+  )
   colnames(summary_table_Benign_Malignant) = tableCols_Benign_Malignant
+  
+  # Sort by FDR q-value (ascending)
   summary_table_Benign_Malignant = summary_table_Benign_Malignant[order(
-    summary_table_Benign_Malignant[,9]),]
-  if(all)
-  {
-    cNames = colnames(summary_table_Benign_Malignant)  
+    summary_table_Benign_Malignant[, 9]), ]
+  
+  # Return all genes without filtering if requested
+  if(all) {
     return(summary_table_Benign_Malignant)
   }
-  summaryTable = summary_table_Benign_Malignant[which(summary_table_Benign_Malignant$`FDR q-value ` < 0.1),]
-  summaryTable = summaryTable[c(which(summaryTable[,7] > 1.3),
-                                which(summaryTable[,7] < 1/1.3)), ]
+  
+  # Apply TDEA thresholds: FDR < 0.1, fold change > 1.3, minimum expression > 3
+  summaryTable = summary_table_Benign_Malignant[
+    which(summary_table_Benign_Malignant$`FDR q-value ` < 0.1), ]
+  summaryTable = summaryTable[c(
+    which(summaryTable[, 7] > 1.3),
+    which(summaryTable[, 7] < 1/1.3)
+  ), ]
   
   lowExprCutOff = 3
+  # NOTE: "Median OC" was the original column name when this function was used
+  # with ovarian cancer data. When called with groupA="GBM", groupB="HC", the
+  # actual column is "Median GBM". Because $`Median OC` returns NULL here,
+  # the filter only requires HC median > 3. This is preserved for result
+  # reproducibility with the published manuscript.
   highHc = which(summaryTable$`Median HC` > lowExprCutOff)
   highOc = which(summaryTable$`Median OC` > lowExprCutOff)
   highExpr = unique(c(highHc, highOc))
-  summaryTable = summaryTable[highExpr,] 
+  summaryTable = summaryTable[highExpr, ]
   return(summaryTable)
-  
 }
- 
-sampleInfoAll$full_ori_patientgroup = sampleInfoAll$ori_patientgroup
-gbmSamples = sampleInfoAll[which(sampleInfoAll$ori_patientgroup == "GBM"),] 
-library(caret) 
-hcId = which(sampleInfoAll$ori_patientgroup == "HC" & sampleInfoAll$isolationlocation != "NKI"  & sampleInfoAll$group == "nonMalignant")
 
-gbmId = which(sampleInfoAll$ori_patientgroup == "GBM" & sampleInfoAll$isolationlocation != "NKI")
+# =============================================================================
+# 3. Define the study cohort (GBM + HC, excluding NKI controls)
+# =============================================================================
+
+sampleInfoAll$full_ori_patientgroup = sampleInfoAll$ori_patientgroup
+gbmSamples = sampleInfoAll[which(sampleInfoAll$ori_patientgroup == "GBM"),]
+
+library(caret)
+
+# Select healthy controls from non-NKI sites only (NKI excluded per study protocol)
+hcId = which(sampleInfoAll$ori_patientgroup == "HC" &
+               sampleInfoAll$isolationlocation != "NKI" &
+               sampleInfoAll$group == "nonMalignant")
+
+# Select GBM patients from non-NKI sites
+gbmId = which(sampleInfoAll$ori_patientgroup == "GBM" &
+                sampleInfoAll$isolationlocation != "NKI")
+
 toInclude = c(hcId, gbmId)
-sampleInfoAll = sampleInfoAll[toInclude,]
+sampleInfoAll = sampleInfoAll[toInclude, ]
 countsAllDeseq = countsAllDeseq[, toInclude]
-hcId = which(sampleInfoAll$ori_patientgroup == "HC" & sampleInfoAll$isolationlocation != "NKI"  & sampleInfoAll$group == "nonMalignant")
-gbmId = which(sampleInfoAll$ori_patientgroup == "GBM" & sampleInfoAll$isolationlocation != "NKI")
+
+# Refresh indices after subsetting
+hcId = which(sampleInfoAll$ori_patientgroup == "HC" &
+               sampleInfoAll$isolationlocation != "NKI" &
+               sampleInfoAll$group == "nonMalignant")
+gbmId = which(sampleInfoAll$ori_patientgroup == "GBM" &
+                sampleInfoAll$isolationlocation != "NKI")
+
+# =============================================================================
+# 4. Train/test split (60/40)
+# =============================================================================
 
 set.seed(12345)
 
+# Default: 10-fold stratified split (folds 1-6 = train, 7-10 = test)
 folds = createFolds(sampleInfoAll$ori_patientgroup[toInclude], k = 10)
 trainId = toInclude[unlist(folds[1:6])]
-testId =toInclude[ unlist(folds[7:10])]
-if(useArticleSplit)
-{
+testId = toInclude[unlist(folds[7:10])]
+
+# Override with the fixed split used in the manuscript for reproducibility
+if(useArticleSplit) {
   trainId = read.table("../data/rawdata/train_ids_final.tsv")
   trainId = trainId$V1
   trainId = trainId[which(!is.na(match(trainId, colnames(countsAllDeseq))))]
   trainId = (match(trainId, colnames(countsAllDeseq)))
+  
   testId = read.table("../data/rawdata/testId_ids_final.tsv")
   testId = testId$V1
   testId = testId[which(!is.na(match(testId, colnames(countsAllDeseq))))]
   testId = (match(testId, colnames(countsAllDeseq)))
 }
-gbmHc_comparisonTrimmed  = getSummaryTable(countsAllDeseq[,trainId], sampleInfoAll[trainId,], "GBM", "HC", F) 
-# candidates
-candidates = rownames(gbmHc_comparisonTrimmed) 
-countsModel = countsAllDeseq[candidates, ] 
+
+# =============================================================================
+# 5. TDEA: identify differentially expressed candidate genes on TRAINING data only
+# =============================================================================
+
+# Run differential expression on training set (leak-free: test set not used)
+gbmHc_comparisonTrimmed = getSummaryTable(
+  countsAllDeseq[, trainId], sampleInfoAll[trainId, ], "GBM", "HC", F
+)
+
+# Candidate genes passing TDEA thresholds (FDR < 0.1, FC > 1.3, expression > 3)
+candidates = rownames(gbmHc_comparisonTrimmed)
+
+# Subset counts to candidate genes for modeling
+countsModel = countsAllDeseq[candidates, ]
 countsModel_deseq = countsModel[, toInclude]
-countsModel_deseq_assignment = data.frame(c(colnames(countsAllDeseq)[trainId], colnames(countsAllDeseq)[testId]))
+
+# Record the train/test assignment for each sample
+countsModel_deseq_assignment = data.frame(
+  c(colnames(countsAllDeseq)[trainId], colnames(countsAllDeseq)[testId])
+)
 colnames(countsModel_deseq_assignment) = "Sample"
 countsModel_deseq_assignment$Train = 0
 countsModel_deseq_assignment$Train[1:length(trainId)] = 1
 countsModel_deseq_assignment$Test = 1
 countsModel_deseq_assignment$Test[1:length(trainId)] = 0
-deseq_output = gbmHc_comparisonTrimmed   
+deseq_output = gbmHc_comparisonTrimmed
 
+# =============================================================================
+# 6. Elastic Net classification (first pass: all candidate genes)
+# =============================================================================
+
+# Prepare training and test matrices (samples x genes)
 trainX = countsModel[, trainId]
-
-testX = countsModel[, testId] 
+testX = countsModel[, testId]
 trainY = factor(sampleInfoAll$ori_patientgroup[trainId])
-testY = factor(sampleInfoAll$ori_patientgroup[testId]) 
-library(party) 
-trainX = t(trainX ) 
-trainX = as.data.frame(trainX) 
+testY = factor(sampleInfoAll$ori_patientgroup[testId])
+
+library(party)
+
+trainX = t(trainX)
+trainX = as.data.frame(trainX)
 trainX$group = as.factor(trainY)
 
-testX = t(testX ) 
-testX = as.data.frame(testX) 
+testX = t(testX)
+testX = as.data.frame(testX)
 testX$group = as.factor(testY)
-library(dplyr) 
+
+library(dplyr)
 library(glmnet)
-library(caret) 
+
 realRefsTrain = trainX$group
 realRefsTest = testX$group
+
+# 5x5 repeated cross-validation with random hyperparameter search
 control <- trainControl(method = "repeatedcv",
                         number = 5,
                         repeats = 5,
                         search = "random",
                         verboseIter = TRUE)
+
+# Train Elastic Net (glmnet) on all TDEA-selected candidate genes
 elasticModel <- train(group ~ .,
-                       data = trainX,
-                       method = "glmnet",
-                       #preProcess = c("center", "scale"),
-                       tuneLength = 25,
-                       trControl = control)
-elasticModel
+                      data = trainX,
+                      method = "glmnet",
+                      tuneLength = 25,
+                      trControl = control)
+print(elasticModel)
+
+# --- Evaluate first-pass model ---
 
 predictionsTrain = predict(elasticModel, trainX)
 probabilitiesTrain = predict(elasticModel, trainX, type = "prob")
-# save(elasticModel, file = "regressionModel.RData")
 
 table(predictionsTrain, realRefsTrain)
 confusionMatrixTrain = confusionMatrix(predictionsTrain, realRefsTrain)
-confusionMatrixTrain
+print(confusionMatrixTrain)
 
 predictionsTest = predict(elasticModel, testX)
 probabilitiesTest = predict(elasticModel, testX, type = "prob")
 
-boxplot(probabilitiesTest[,1] ~ realRefsTest)
+if (interactive()) boxplot(probabilitiesTest[, 1] ~ realRefsTest)
 
+# Apply a lowered probability threshold (0.25) to increase GBM sensitivity
 thresholdedPredictionsTest = rep("HC", length(predictionsTest))
-thresholdedPredictionsTest[which(probabilitiesTest[,1] > 0.25)] = "GBM"
+thresholdedPredictionsTest[which(probabilitiesTest[, 1] > 0.25)] = "GBM"
 
 thresholdedPredictionsTrain = rep("HC", length(realRefsTrain))
-thresholdedPredictionsTrain[which(probabilitiesTrain[,1] > 0.25)] = "GBM"
+thresholdedPredictionsTrain[which(probabilitiesTrain[, 1] > 0.25)] = "GBM"
 
-confusionMatrixTrain = confusionMatrix(as.factor(thresholdedPredictionsTrain), realRefsTrain) 
+confusionMatrixTrain = confusionMatrix(as.factor(thresholdedPredictionsTrain), realRefsTrain)
 
 table(thresholdedPredictionsTest, realRefsTest)
-confusionMatrix(as.factor(thresholdedPredictionsTest), as.factor(realRefsTest), positive = "GBM")
+print(confusionMatrix(as.factor(thresholdedPredictionsTest), as.factor(realRefsTest), positive = "GBM"))
 
 table(predictionsTest, realRefsTest)
-confusionMatrixTest = confusionMatrix(as.factor(thresholdedPredictionsTest), reference = as.factor(realRefsTest), positive = "GBM")
-confusionMatrixTest
+confusionMatrixTest = confusionMatrix(
+  as.factor(thresholdedPredictionsTest),
+  reference = as.factor(realRefsTest),
+  positive = "GBM"
+)
+print(confusionMatrixTest)
 
-# save.image(paste0("afterElasticNet", Sys.Date(), ".RData")) 
-weightThreshold = 0.05 
-toKeepElNet =  stats::predict(elasticModel$finalModel, type = "coefficients", s = elasticModel$bestTune$lambda) 
-toKeepElNetDF = as.matrix(toKeepElNet)
-toKeepElNetDF = as.data.frame(toKeepElNetDF)
-toKeepElNetDF = toKeepElNetDF[-1,, drop = F]
-fullModel = rownames(toKeepElNetDF)[which(abs(toKeepElNetDF$s1) > 0.0)]
+# =============================================================================
+# 7. Secondary feature selection: keep genes with |coefficient| > threshold
+# =============================================================================
+
+weightThreshold = 0.05
+
+# Extract Elastic Net coefficients at the optimal lambda
+toKeepElNet = stats::predict(
+  elasticModel$finalModel, type = "coefficients",
+  s = elasticModel$bestTune$lambda
+)
+toKeepElNetDF = as.data.frame(as.matrix(toKeepElNet))
+toKeepElNetDF = toKeepElNetDF[-1, , drop = F]  # Remove intercept row
+toKeepElNetDF[, 1] = as.numeric(toKeepElNetDF[, 1])  # Ensure plain numeric
+
+# Full model: all genes with non-zero coefficients
+fullModel = rownames(toKeepElNetDF)[which(abs(toKeepElNetDF[, 1]) > 0.0)]
 fullModel = gsub("`", "", fullModel)
-# write.table(fullModel, file = "fullModel_final.tsv", row.names = F, col.names = F, sep = "\t", quote = F) 
-maxWeights = rowMaxs(as.matrix(abs(toKeepElNetDF)))
-toKeepElNetDF = toKeepElNetDF[which(maxWeights > weightThreshold),, drop =F] 
-allSelectedEnsg = rownames(toKeepElNetDF) 
-allSelectedEnsg = gsub("`", "", allSelectedEnsg) 
+
+# Reduced panel: genes with |weight| above threshold
+maxWeights = abs(toKeepElNetDF[, 1])
+toKeepElNetDF = toKeepElNetDF[which(maxWeights > weightThreshold), , drop = F]
+allSelectedEnsg = rownames(toKeepElNetDF)
+allSelectedEnsg = gsub("`", "", allSelectedEnsg)
+
+# =============================================================================
+# 8. Test set AUC and confusion matrix visualization
+# =============================================================================
+
 library(cvAUC)
-cvAUC( probabilitiesTest[,1], realRefsTest, label.ordering = c("HC", "GBM"))
-AUC =  cvAUC( probabilitiesTest[,1], realRefsTest, label.ordering = c("HC", "GBM")) 
+AUC = cvAUC(probabilitiesTest[, 1], realRefsTest, label.ordering = c("HC", "GBM"))
+
+# Confusion matrix heatmap for the test set
 cmTest <- confusionMatrixTest
 plt <- as.data.frame(cmTest$table)
-plt$Prediction <- factor(plt$Prediction, levels=rev(levels(plt$Prediction)))
+plt$Prediction <- factor(plt$Prediction, levels = rev(levels(plt$Prediction)))
 
-pdf(paste0('../Report/',
-  "Confusion_matrix_test",  ".pdf" ) )
-confPlot = ggplot(plt, aes(Prediction,Reference, fill= Freq)) +
-  geom_tile() + geom_text(aes(label=Freq)) +
-  scale_fill_gradient(low="white", high="#009194") +
-  labs(x = "Reference",y = "Prediction") +
-  scale_x_discrete(labels=c("HC","GBM")) +
-  scale_y_discrete(labels=c("GBM","HC"))
-
+pdf(paste0('../Report/', "Confusion_matrix_test", ".pdf"))
+confPlot = ggplot(plt, aes(Prediction, Reference, fill = Freq)) +
+  geom_tile() + geom_text(aes(label = Freq)) +
+  scale_fill_gradient(low = "white", high = "#009194") +
+  labs(x = "Reference", y = "Prediction") +
+  scale_x_discrete(labels = c("HC", "GBM")) +
+  scale_y_discrete(labels = c("GBM", "HC"))
 
 print(confPlot)
 dev.off()
-library(ggforce)
-library(dplyr)
+
+# =============================================================================
+# 9. Reactome pathway enrichment (ORA) on the final Elastic Net gene panel
+# =============================================================================
+
 library(org.Hs.eg.db)
 library(clusterProfiler)
-
-library(org.Hs.eg.db)
-
-
-library(ggforce)
-library(dplyr)
-library(org.Hs.eg.db)
-library(clusterProfiler)
-library(org.Hs.eg.db) 
-library(openxlsx)
-  
-deGenes = allSelectedEnsg 
-geneUniverse = rownames(dataFiltered) 
 library(openxlsx)
 
+deGenes = allSelectedEnsg         # Final panel genes (HGNC symbols)
+geneUniverse = rownames(dataFiltered)  # Background: all expressed genes
 
-c3.tf <- read.gmt("../data/c2.cp.reactome.v2022.1.Hs.symbols.gmt") 
-presentFromReact = which(is.element(c3.tf$gene,geneUniverse))# rownames(dataFiltered)))
-c3.tf = c3.tf[presentFromReact,]
- 
-ans.react = enricher(allSelectedEnsg, TERM2GENE=c3.tf , pAdjustMethod = "fdr", qvalueCutoff = 0.5)
-dfReact = ans.react@result[1:10,]
+# Load Reactome gene sets (MSigDB format)
+c3.tf <- read.gmt("../data/c2.cp.reactome.v2022.1.Hs.symbols.gmt")
+presentFromReact = which(is.element(c3.tf$gene, geneUniverse))
+c3.tf = c3.tf[presentFromReact, ]
+
+# Run overrepresentation analysis against Reactome pathways
+ans.react = enricher(allSelectedEnsg, TERM2GENE = c3.tf,
+                     pAdjustMethod = "fdr", qvalueCutoff = 0.5)
+
+# --- Prepare Reactome bar chart data ---
+
+dfReact = ans.react@result[1:10, ]
+
+# Parse the GeneRatio and BgRatio strings into numeric values
 noGenes = strsplit(dfReact$GeneRatio, "/")
-noGenesPlus = as.numeric(unlist( lapply(noGenes, `[[`, 1)))
-noGenesAll = as.numeric(unlist( lapply(noGenes, `[[`, 2)))
+noGenesPlus = as.numeric(unlist(lapply(noGenes, `[[`, 1)))
+noGenesAll = as.numeric(unlist(lapply(noGenes, `[[`, 2)))
 
 noBg = strsplit(dfReact$BgRatio, "/")
-noBgPlus = as.numeric(unlist( lapply(noBg, `[[`, 1)))
-noBgAll = as.numeric(unlist( lapply(noBg, `[[`, 2)))
+noBgPlus = as.numeric(unlist(lapply(noBg, `[[`, 1)))
+noBgAll = as.numeric(unlist(lapply(noBg, `[[`, 2)))
+
 dfReact$noGenesPlus = noGenesPlus
 dfReact$noGenesAll = noGenesAll
 dfReact$noBgPlus = noBgPlus
 dfReact$noBgAll = noBgAll
-dfReact$Pct_selected = round(100*dfReact$noGenesPlus/dfReact$noGenesAll,2)
-dfReact$Pct_background = round(100*dfReact$noBgPlus/dfReact$noBgAll,2)
-dfReact$LogP = -1*(log10(dfReact$pvalue))
+dfReact$Pct_selected = round(100 * dfReact$noGenesPlus / dfReact$noGenesAll, 2)
+dfReact$Pct_background = round(100 * dfReact$noBgPlus / dfReact$noBgAll, 2)
+dfReact$LogP = -1 * (log10(dfReact$pvalue))
 
-dfReactChartP = cbind(dfReact$Description, dfReact$LogP, rep("p", nrow(dfReact)), paste0("p=", round(dfReact$pvalue,6)))
-dfReactChartPct_selected = cbind(dfReact$Description, dfReact$Pct_selected, rep("Percentage selected", nrow(dfReact)), paste0( dfReact$Pct_selected, "%") )
-dfReactChartPct_background = cbind(dfReact$Description, dfReact$Pct_background, rep("Percentage background", nrow(dfReact)), paste0( dfReact$Pct_background, "%") )
-dfReactChart = rbind(dfReactChartP, dfReactChartPct_selected,  dfReactChartPct_background)
+# Reshape to long format for grouped bar chart
+dfReactChartP = cbind(dfReact$Description, dfReact$LogP,
+                      rep("p", nrow(dfReact)),
+                      paste0("p=", round(dfReact$pvalue, 6)))
+dfReactChartPct_selected = cbind(dfReact$Description, dfReact$Pct_selected,
+                                  rep("Percentage selected", nrow(dfReact)),
+                                  paste0(dfReact$Pct_selected, "%"))
+dfReactChartPct_background = cbind(dfReact$Description, dfReact$Pct_background,
+                                    rep("Percentage background", nrow(dfReact)),
+                                    paste0(dfReact$Pct_background, "%"))
+
+dfReactChart = rbind(dfReactChartP, dfReactChartPct_selected, dfReactChartPct_background)
 dfReactChart = as.data.frame(dfReactChart)
 colnames(dfReactChart) = c("Pathway", "Value", "Type", "Text")
 dfReactChart$Value = as.numeric(dfReactChart$Value)
+
+# Strip the REACTOME_ prefix for cleaner labels
 dfReactChart$Pathway = gsub("REACTOME_", "", dfReactChart$Pathway)
 save(dfReactChart, file = "dfReactChart_v3.RData")
+
+# Plot top 10 Reactome pathways (grouped bars: -log10 p, % selected, % background)
 pdf("../Report/reactome_top_10.pdf", width = 20, height = 8)
-ggplot(data=dfReactChart, aes(x=Pathway,y=Value,fill=factor(Type))) +
-  geom_bar(position="dodge",stat="identity") +
+ggplot(data = dfReactChart, aes(x = Pathway, y = Value, fill = factor(Type))) +
+  geom_bar(position = "dodge", stat = "identity") +
   coord_flip() +
   ylab("- Log10 p") +
-  ggtitle("Reactome analysis") + 
+  ggtitle("Reactome analysis") +
   geom_text(aes(label = Text),
-            position = position_dodge(width= 1), size = 3) + 
+            position = position_dodge(width = 1), size = 3) +
   theme_bw()
 dev.off()
-toSaveX = ans.react@result[which(ans.react@result$pvalue < 0.05),]
-toSaveX = toSaveX[, -c(6,7)]
-openxlsx::write.xlsx(toSaveX, file = "Reactome_final_selection_vs_all_considered.xlsx") 
 
-deGenes = allSelectedEnsg 
+# Save significant Reactome results (p < 0.05) to Excel
+toSaveX = ans.react@result[which(ans.react@result$pvalue < 0.05), ]
+toSaveX = toSaveX[, -c(6, 7)]
+openxlsx::write.xlsx(toSaveX, file = "Reactome_final_selection_vs_all_considered.xlsx")
 
+# =============================================================================
+# 10. Gene Ontology enrichment (ORA) on the final Elastic Net gene panel
+# =============================================================================
 
+deGenes = allSelectedEnsg
+
+# Map HGNC symbols to Ensembl IDs, then to Entrez IDs (required by enrichGO)
 ensgs = genes$ensembl_gene_id[match(deGenes, genes$hgnc_symbol)]
- 
-ensgUniverse = genes$ensembl_gene_id[match(rownames(dataFiltered), genes$hgnc_symbol)]
 
+ensgUniverse = genes$ensembl_gene_id[match(rownames(dataFiltered), genes$hgnc_symbol)]
 ensgUniverse = ensgUniverse[which(!is.na(ensgUniverse))]
-deGenes =   unlist(mget(ensgs[which(!is.na(ensgs))], envir=org.Hs.egENSEMBL2EG,
-                        ifnotfound = NA))
-symbolUniverse = unlist(mget(ensgUniverse[which(!is.na(ensgUniverse))], envir=org.Hs.egENSEMBL2EG,
-                             ifnotfound = NA))
+
+deGenes = unlist(mget(ensgs[which(!is.na(ensgs))], envir = org.Hs.egENSEMBL2EG,
+                       ifnotfound = NA))
+symbolUniverse = unlist(mget(ensgUniverse[which(!is.na(ensgUniverse))],
+                              envir = org.Hs.egENSEMBL2EG, ifnotfound = NA))
 symbolUniverse = symbolUniverse[which(!is.na(symbolUniverse))]
+
 set.seed(123)
 
+# GO enrichment across all ontologies (for exploration)
 ans.go <- enrichGO(gene = deGenes, ont = "All",
-                   OrgDb ="org.Hs.eg.db",
+                   OrgDb = "org.Hs.eg.db",
                    universe = symbolUniverse,
-                   readable=TRUE,
+                   readable = TRUE,
                    pvalueCutoff = 1, qvalueCutoff = 1, pAdjustMethod = "fdr")
+# Print top GO results (use View() interactively for full table)
+head(ans.go@result, 20)
 
-View(ans.go@result) 
+# GO enrichment restricted to Biological Process (for the manuscript figure)
 ans.go3 <- enrichGO(gene = deGenes, ont = "BP",
-                    OrgDb ="org.Hs.eg.db",
+                    OrgDb = "org.Hs.eg.db",
                     universe = symbolUniverse,
-                    readable=TRUE,
+                    readable = TRUE,
                     pvalueCutoff = 1, qvalueCutoff = 1, pAdjustMethod = "fdr")
 
-dfGo = ans.go3@result[1:10,]
+# --- Prepare GO bar chart data (same structure as Reactome) ---
+
+dfGo = ans.go3@result[1:10, ]
+
 noGenes = strsplit(dfGo$GeneRatio, "/")
-noGenesPlus = as.numeric(unlist( lapply(noGenes, `[[`, 1)))
-noGenesAll = as.numeric(unlist( lapply(noGenes, `[[`, 2)))
+noGenesPlus = as.numeric(unlist(lapply(noGenes, `[[`, 1)))
+noGenesAll = as.numeric(unlist(lapply(noGenes, `[[`, 2)))
 
 noBg = strsplit(dfGo$BgRatio, "/")
-noBgPlus = as.numeric(unlist( lapply(noBg, `[[`, 1)))
-noBgAll = as.numeric(unlist( lapply(noBg, `[[`, 2)))
+noBgPlus = as.numeric(unlist(lapply(noBg, `[[`, 1)))
+noBgAll = as.numeric(unlist(lapply(noBg, `[[`, 2)))
+
 dfGo$noGenesPlus = noGenesPlus
 dfGo$noGenesAll = noGenesAll
 dfGo$noBgPlus = noBgPlus
 dfGo$noBgAll = noBgAll
-dfGo$Pct_selected = round(100*dfGo$noGenesPlus/dfGo$noGenesAll,2)
-dfGo$Pct_background = round(100*dfGo$noBgPlus/dfGo$noBgAll,2)
-dfGo$LogP = -1*(log10(dfGo$pvalue))
+dfGo$Pct_selected = round(100 * dfGo$noGenesPlus / dfGo$noGenesAll, 2)
+dfGo$Pct_background = round(100 * dfGo$noBgPlus / dfGo$noBgAll, 2)
+dfGo$LogP = -1 * (log10(dfGo$pvalue))
 
-dfGoChartP = cbind(dfGo$Description, dfGo$LogP, rep("p", nrow(dfGo)), paste0("p=", round(dfGo$pvalue,6)))
-dfGoChartPct_selected = cbind(dfGo$Description, dfGo$Pct_selected, rep("Percentage selected", nrow(dfGo)), paste0( dfGo$Pct_selected, "%") )
-dfGoChartPct_background = cbind(dfGo$Description, dfGo$Pct_background, rep("Percentage background", nrow(dfGo)), paste0( dfGo$Pct_background, "%") )
-dfGoChart = rbind(dfGoChartP, dfGoChartPct_selected,  dfGoChartPct_background)
+dfGoChartP = cbind(dfGo$Description, dfGo$LogP,
+                   rep("p", nrow(dfGo)),
+                   paste0("p=", round(dfGo$pvalue, 6)))
+dfGoChartPct_selected = cbind(dfGo$Description, dfGo$Pct_selected,
+                               rep("Percentage selected", nrow(dfGo)),
+                               paste0(dfGo$Pct_selected, "%"))
+dfGoChartPct_background = cbind(dfGo$Description, dfGo$Pct_background,
+                                 rep("Percentage background", nrow(dfGo)),
+                                 paste0(dfGo$Pct_background, "%"))
+
+dfGoChart = rbind(dfGoChartP, dfGoChartPct_selected, dfGoChartPct_background)
 dfGoChart = as.data.frame(dfGoChart)
 colnames(dfGoChart) = c("Pathway", "Value", "Type", "Text")
 dfGoChart$Value = as.numeric(dfGoChart$Value)
 save(dfGoChart, file = "dfGoChart.RData")
+
+# Plot top 10 GO Biological Process terms
 pdf("../Report/gene_ontology_top_10.pdf", width = 20, height = 8)
-ggplot(data=dfGoChart, aes(x=Pathway,y=Value,fill=factor(Type))) +
-  geom_bar(position="dodge",stat="identity") +
+ggplot(data = dfGoChart, aes(x = Pathway, y = Value, fill = factor(Type))) +
+  geom_bar(position = "dodge", stat = "identity") +
   coord_flip() +
   ylab("- Log10 p") +
-  ggtitle("Gene Ontology analysis") + 
+  ggtitle("Gene Ontology analysis") +
   geom_text(aes(label = Text),
-            position = position_dodge(width= 1), size = 3) + 
+            position = position_dodge(width = 1), size = 3) +
   theme_bw()
 dev.off()
 
-selectedVars = rownames(toKeepElNetDF)[which(abs(toKeepElNetDF$s1) > weightThreshold)]
-selectedVars = gsub("`", "", selectedVars)  # Clean variable names
+# =============================================================================
+# 11. Refit Elastic Net on reduced gene panel (|coefficient| > threshold)
+# =============================================================================
 
-# Subset trainX and testX to include only selected variables (plus the group column)
+selectedVars = rownames(toKeepElNetDF)
+selectedVars = gsub("`", "", selectedVars)
+
+# Subset training and test data to the reduced gene panel
 trainX_subset = trainX[, c(selectedVars, "group")]
 testX_subset = testX[, c(selectedVars, "group")]
 
-# Define training control
+# Same CV setup as before
 control <- trainControl(method = "repeatedcv",
                         number = 5,
                         repeats = 5,
                         search = "random",
                         verboseIter = TRUE)
 
-# Train new elastic net model with selected variables
+# Refit Elastic Net on the reduced feature set
 elasticModel_subset <- train(group ~ .,
                              data = trainX_subset,
                              method = "glmnet",
                              tuneLength = 25,
                              trControl = control)
-elasticModel_subset
+print(elasticModel_subset)
 
-# Predictions and probabilities on training set
+# --- Evaluate reduced model on training set ---
 predictionsTrain = predict(elasticModel_subset, trainX_subset)
 probabilitiesTrain = predict(elasticModel_subset, trainX_subset, type = "prob")
 
-# Confusion matrix for training set
 table(predictionsTrain, realRefsTrain)
 confusionMatrixTrain = confusionMatrix(predictionsTrain, realRefsTrain)
-confusionMatrixTrain
+print(confusionMatrixTrain)
 
-# Predictions and probabilities on test set
+# --- Evaluate reduced model on test set ---
 predictionsTest = predict(elasticModel_subset, testX_subset)
 probabilitiesTest = predict(elasticModel_subset, testX_subset, type = "prob")
 
-# Boxplot of probabilities
-boxplot(probabilitiesTest[,1] ~ realRefsTest)
+if (interactive()) boxplot(probabilitiesTest[, 1] ~ realRefsTest)
 
-# Thresholded predictions for test set
+# Thresholded predictions (probability > 0.25 classified as GBM)
 thresholdedPredictionsTest = rep("HC", length(predictionsTest))
-thresholdedPredictionsTest[which(probabilitiesTest[,1] > 0.25)] = "GBM"
+thresholdedPredictionsTest[which(probabilitiesTest[, 1] > 0.25)] = "GBM"
 
-# Thresholded predictions for training set
 thresholdedPredictionsTrain = rep("HC", length(realRefsTrain))
-thresholdedPredictionsTrain[which(probabilitiesTrain[,1] > 0.25)] = "GBM"
+thresholdedPredictionsTrain[which(probabilitiesTrain[, 1] > 0.25)] = "GBM"
 
-# Confusion matrix for thresholded predictions (training)
-confusionMatrixTrain = confusionMatrix(as.factor(thresholdedPredictionsTrain), realRefsTrain) 
-confusionMatrixTrain
+# Confusion matrices for thresholded predictions
+confusionMatrixTrain = confusionMatrix(as.factor(thresholdedPredictionsTrain), realRefsTrain)
+print(confusionMatrixTrain)
 
-# Confusion matrix for thresholded predictions (test)
 table(thresholdedPredictionsTest, realRefsTest)
-confusionMatrixTest = confusionMatrix(as.factor(thresholdedPredictionsTest), as.factor(realRefsTest), positive = "GBM")
-confusionMatrixTest
+confusionMatrixTest = confusionMatrix(
+  as.factor(thresholdedPredictionsTest), as.factor(realRefsTest), positive = "GBM"
+)
+print(confusionMatrixTest)
 
-# Confusion matrix for raw predictions (test)
+# Confusion matrix for default-threshold predictions
 table(predictionsTest, realRefsTest)
-confusionMatrixTest = confusionMatrix(as.factor(predictionsTest), as.factor(realRefsTest), positive = "GBM")
-confusionMatrixTest
+confusionMatrixTest = confusionMatrix(
+  as.factor(predictionsTest), as.factor(realRefsTest), positive = "GBM"
+)
+print(confusionMatrixTest)
+
+# =============================================================================
+# 12. Three-way GO Biological Process enrichment across pipeline stages
+# =============================================================================
+#
+# Compares GO BP enrichment results across the three nested gene sets produced
+# by the pipeline:
+#   1. candidates         -- TDEA-selected genes (FDR < 0.1, FC > 1.3, expr > 3)
+#   2. fullModel          -- all genes with non-zero Elastic Net coefficients
+#   3. allSelectedEnsg    -- final panel (|coefficient| > 0.05)
+#
+# A Venn diagram shows overlap of significant GO terms between sets,
+# produced for both FDR-adjusted (p.adjust < 0.05) and unadjusted (p < 0.05)
+# significance thresholds.
+
+library(VennDiagram)
+library(grid)
+
+# --- Convert each gene set from HGNC symbols to Entrez IDs ---
+# (enrichGO requires Entrez IDs; universe already computed in section 10)
+
+symbolsToEntrez = function(symbols) {
+  ensIds = genes$ensembl_gene_id[match(symbols, genes$hgnc_symbol)]
+  ensIds = ensIds[which(!is.na(ensIds))]
+  entrezIds = unlist(mget(ensIds, envir = org.Hs.egENSEMBL2EG, ifnotfound = NA))
+  entrezIds[which(!is.na(entrezIds))]
+}
+
+entrezCandidates  = symbolsToEntrez(candidates)       # TDEA-selected
+entrezFullModel   = symbolsToEntrez(fullModel)         # non-zero coefficients
+entrezFinalPanel  = symbolsToEntrez(allSelectedEnsg)   # |coef| > threshold
+
+# --- Run GO BP enrichment for each gene set ---
+
+set.seed(123)
+
+goBpCandidates = enrichGO(
+  gene = entrezCandidates, ont = "BP", OrgDb = "org.Hs.eg.db",
+  universe = symbolUniverse, readable = TRUE,
+  pvalueCutoff = 1, qvalueCutoff = 1, pAdjustMethod = "fdr"
+)
+
+goBpFullModel = enrichGO(
+  gene = entrezFullModel, ont = "BP", OrgDb = "org.Hs.eg.db",
+  universe = symbolUniverse, readable = TRUE,
+  pvalueCutoff = 1, qvalueCutoff = 1, pAdjustMethod = "fdr"
+)
+
+goBpFinalPanel = enrichGO(
+  gene = entrezFinalPanel, ont = "BP", OrgDb = "org.Hs.eg.db",
+  universe = symbolUniverse, readable = TRUE,
+  pvalueCutoff = 1, qvalueCutoff = 1, pAdjustMethod = "fdr"
+)
+
+# Save significant results (unadjusted p < 0.05) to Excel
+write.xlsx(
+  goBpCandidates@result[which(goBpCandidates@result$pvalue < 0.05), -c(6, 7)],
+  file = "GO_BP_candidates_vs_all.xlsx"
+)
+write.xlsx(
+  goBpFullModel@result[which(goBpFullModel@result$pvalue < 0.05), -c(6, 7)],
+  file = "GO_BP_fullModel_vs_all.xlsx"
+)
+write.xlsx(
+  goBpFinalPanel@result[which(goBpFinalPanel@result$pvalue < 0.05), -c(6, 7)],
+  file = "GO_BP_finalSelection_vs_all.xlsx"
+)
+
+# --- Extract significant pathway names at both thresholds ---
+
+# FDR-adjusted (p.adjust < 0.05)
+sigAdjCandidates  = goBpCandidates@result$Description[which(goBpCandidates@result$p.adjust < 0.05)]
+sigAdjFullModel   = goBpFullModel@result$Description[which(goBpFullModel@result$p.adjust < 0.05)]
+sigAdjFinalPanel  = goBpFinalPanel@result$Description[which(goBpFinalPanel@result$p.adjust < 0.05)]
+
+# Unadjusted (p < 0.05)
+sigRawCandidates  = goBpCandidates@result$Description[which(goBpCandidates@result$pvalue < 0.05)]
+sigRawFullModel   = goBpFullModel@result$Description[which(goBpFullModel@result$pvalue < 0.05)]
+sigRawFinalPanel  = goBpFinalPanel@result$Description[which(goBpFinalPanel@result$pvalue < 0.05)]
+
+cat("Significant GO BP terms (FDR-adjusted p < 0.05):\n")
+cat("  TDEA candidates:", length(sigAdjCandidates), "\n")
+cat("  Non-zero in model:", length(sigAdjFullModel), "\n")
+cat("  Final panel:", length(sigAdjFinalPanel), "\n")
+
+cat("\nSignificant GO BP terms (unadjusted p < 0.05):\n")
+cat("  TDEA candidates:", length(sigRawCandidates), "\n")
+cat("  Non-zero in model:", length(sigRawFullModel), "\n")
+cat("  Final panel:", length(sigRawFinalPanel), "\n")
+
+# --- Venn diagram helper ---
+
+vennColors = c("#4477AA", "#EE6677", "#228833")
+vennSetNames = c("TDEA candidates", "Non-zero in model", "Final panel")
+
+drawGoVenn = function(pathList, titleText, outFile) {
+  pdf(outFile, width = 7, height = 7)
+  vennObj = venn.diagram(
+    x = setNames(pathList, vennSetNames),
+    filename = NULL,
+    fill = vennColors,
+    alpha = 0.45,
+    col = vennColors,
+    lwd = 1.5,
+    fontfamily = "sans",
+    cat.fontfamily = "sans",
+    cat.fontface = "bold",
+    cat.cex = 1.1,
+    cex = 1.3,
+    margin = 0.1,
+    main = titleText,
+    main.fontfamily = "sans",
+    main.cex = 1.3,
+    main.fontface = "bold"
+  )
+  grid.draw(vennObj)
+  dev.off()
+}
+
+# --- Venn diagram: FDR-adjusted significance ---
+
+drawGoVenn(
+  pathList  = list(sigAdjCandidates, sigAdjFullModel, sigAdjFinalPanel),
+  titleText = "GO BP pathways (FDR-adjusted p < 0.05)",
+  outFile   = "../Report/GO_BP_venn_adjusted.pdf"
+)
+
+# --- Venn diagram: unadjusted significance ---
+
+drawGoVenn(
+  pathList  = list(sigRawCandidates, sigRawFullModel, sigRawFinalPanel),
+  titleText = "GO BP pathways (unadjusted p < 0.05)",
+  outFile   = "../Report/GO_BP_venn_unadjusted.pdf"
+)
+
+# --- Save overlapping pathway names ---
+
+sharedAdj = Reduce(intersect, list(sigAdjCandidates, sigAdjFullModel, sigAdjFinalPanel))
+sharedRaw = Reduce(intersect, list(sigRawCandidates, sigRawFullModel, sigRawFinalPanel))
+
+cat("\nPathways significant in all three sets (FDR-adjusted):", length(sharedAdj), "\n")
+cat("Pathways significant in all three sets (unadjusted):", length(sharedRaw), "\n")
+
+if (length(sharedAdj) > 0) {
+  write.xlsx(data.frame(Pathway = sharedAdj),
+             file = "GO_BP_shared_all_three_adjusted.xlsx")
+}
+if (length(sharedRaw) > 0) {
+  write.xlsx(data.frame(Pathway = sharedRaw),
+             file = "GO_BP_shared_all_three_unadjusted.xlsx")
+}
