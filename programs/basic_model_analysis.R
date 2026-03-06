@@ -473,11 +473,11 @@ dfReactChartP = cbind(dfReact$Description, dfReact$LogP,
                       rep("p", nrow(dfReact)),
                       paste0("p=", round(dfReact$pvalue, 6)))
 dfReactChartPct_selected = cbind(dfReact$Description, dfReact$Pct_selected,
-                                  rep("Percentage selected", nrow(dfReact)),
-                                  paste0(dfReact$Pct_selected, "%"))
+                                 rep("Percentage selected", nrow(dfReact)),
+                                 paste0(dfReact$Pct_selected, "%"))
 dfReactChartPct_background = cbind(dfReact$Description, dfReact$Pct_background,
-                                    rep("Percentage background", nrow(dfReact)),
-                                    paste0(dfReact$Pct_background, "%"))
+                                   rep("Percentage background", nrow(dfReact)),
+                                   paste0(dfReact$Pct_background, "%"))
 
 dfReactChart = rbind(dfReactChartP, dfReactChartPct_selected, dfReactChartPct_background)
 dfReactChart = as.data.frame(dfReactChart)
@@ -518,9 +518,9 @@ ensgUniverse = genes$ensembl_gene_id[match(rownames(dataFiltered), genes$hgnc_sy
 ensgUniverse = ensgUniverse[which(!is.na(ensgUniverse))]
 
 deGenes = unlist(mget(ensgs[which(!is.na(ensgs))], envir = org.Hs.egENSEMBL2EG,
-                       ifnotfound = NA))
+                      ifnotfound = NA))
 symbolUniverse = unlist(mget(ensgUniverse[which(!is.na(ensgUniverse))],
-                              envir = org.Hs.egENSEMBL2EG, ifnotfound = NA))
+                             envir = org.Hs.egENSEMBL2EG, ifnotfound = NA))
 symbolUniverse = symbolUniverse[which(!is.na(symbolUniverse))]
 
 set.seed(123)
@@ -565,11 +565,11 @@ dfGoChartP = cbind(dfGo$Description, dfGo$LogP,
                    rep("p", nrow(dfGo)),
                    paste0("p=", round(dfGo$pvalue, 6)))
 dfGoChartPct_selected = cbind(dfGo$Description, dfGo$Pct_selected,
-                               rep("Percentage selected", nrow(dfGo)),
-                               paste0(dfGo$Pct_selected, "%"))
+                              rep("Percentage selected", nrow(dfGo)),
+                              paste0(dfGo$Pct_selected, "%"))
 dfGoChartPct_background = cbind(dfGo$Description, dfGo$Pct_background,
-                                 rep("Percentage background", nrow(dfGo)),
-                                 paste0(dfGo$Pct_background, "%"))
+                                rep("Percentage background", nrow(dfGo)),
+                                paste0(dfGo$Pct_background, "%"))
 
 dfGoChart = rbind(dfGoChartP, dfGoChartPct_selected, dfGoChartPct_background)
 dfGoChart = as.data.frame(dfGoChart)
@@ -803,3 +803,201 @@ if (length(sharedRaw) > 0) {
   write.xlsx(data.frame(Pathway = sharedRaw),
              file = "GO_BP_shared_all_three_unadjusted.xlsx")
 }
+
+# =============================================================================
+# 13. Build ranked gene list for GSEA (GBM vs HC, training set)
+# =============================================================================
+#
+# Gene ranking metric: sign(log2 FC) * -log10(Wilcoxon p-value)
+# This preserves directionality (GBM-up vs GBM-down) while using the
+# significance of the test to weight the magnitude of the ranking.
+#
+# All expressed genes are used here -- NOT just TDEA candidates --
+# because GSEA operates on a full ranked list, not a pre-filtered set.
+# =============================================================================
+
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(openxlsx)
+library(VennDiagram)
+library(grid)
+
+# Full (unfiltered) DE results on training set
+gbmHc_allGenes = getSummaryTable(
+  countsAllDeseq[, trainId],
+  sampleInfoAll[trainId, ],
+  "GBM", "HC",
+  all = TRUE
+)
+
+fc_col    = which(colnames(gbmHc_allGenes) == "Mean fold change GBM-HC")
+pval_col  = which(colnames(gbmHc_allGenes) == "Wilcoxon p-value ")
+
+fc_vals   = as.numeric(gbmHc_allGenes[, fc_col])
+pval_vals = as.numeric(gbmHc_allGenes[, pval_col])
+
+# Guard against p = 0 (would produce Inf)
+pval_vals[pval_vals == 0] <- .Machine$double.eps
+
+rank_metric = sign(log2(fc_vals)) * (-log10(pval_vals))
+
+# Map HGNC symbols -> Ensembl IDs (gseGO uses ENSEMBL keyType)
+gene_symbols  = rownames(gbmHc_allGenes)
+ensembl_ids   = genes$ensembl_gene_id[match(gene_symbols, genes$hgnc_symbol)]
+
+original_gene_list_gbm = stats::setNames(rank_metric, ensembl_ids)
+
+# Drop unmapped and duplicated entries
+original_gene_list_gbm = original_gene_list_gbm[!is.na(names(original_gene_list_gbm))]
+original_gene_list_gbm = original_gene_list_gbm[!duplicated(names(original_gene_list_gbm))]
+
+gene_list_gbm = na.omit(original_gene_list_gbm)
+gene_list_gbm = sort(gene_list_gbm, decreasing = TRUE)
+
+# =============================================================================
+# 14. GSEA across multiple seeds (GO Biological Process)
+# =============================================================================
+#
+# GSEA results can vary across permutations, so 10 seeds are run and saved
+# individually. The seed=1 run (pvalueCutoff = 1) is kept in memory for
+# downstream visualisation and the ORA/GSEA Venn diagram.
+# =============================================================================
+library(enrichplot)
+for (seed in 1:10) {
+  set.seed(seed)
+  gse_gbm_iter <- gseGO(
+    geneList      = gene_list_gbm,
+    ont           = "ALL",
+    keyType       = "ENSEMBL",
+    nPerm         = 10000,
+    minGSSize     = 3,
+    maxGSSize     = 800,
+    pvalueCutoff  = 0.05,
+    verbose       = TRUE,
+    OrgDb         = org.Hs.eg.db,
+    pAdjustMethod = "fdr"
+  )
+  write.xlsx(gse_gbm_iter,
+             file = paste0("gene_set_enrichment_all_hc_vs_gbm_ref_hc3_", seed, ".xlsx"))
+  save(gse_gbm_iter,
+       file = paste0("gene_set_enrichment_all_hc_vs_gbm_ref_hc3_", seed, ".RData"))
+}
+
+# Re-run seed=1 with pvalueCutoff = 1 and ont = "BP" to match the ORA
+# used in the Venn. Full result set needed for top-100 selection below.
+set.seed(1)
+gse_gbm <- gseGO(
+  geneList      = gene_list_gbm,
+  ont           = "BP",
+  keyType       = "ENSEMBL",
+  nPerm         = 10000,
+  minGSSize     = 3,
+  maxGSSize     = 800,
+  pvalueCutoff  = 1,          # no cutoff -- needed to get >= 100 results
+  verbose       = FALSE,
+  OrgDb         = org.Hs.eg.db,
+  pAdjustMethod = "fdr"
+)
+
+# =============================================================================
+# 15. GSEA visualisation
+# =============================================================================
+
+library(DOSE)
+library(ggplot2)
+
+pdf("../Report/gsea_dotplot_BP.pdf", width = 10, height = 8)
+print(
+  dotplot(gse_gbm, showCategory = 10, split = ".sign") +
+    facet_grid(. ~ .sign) +
+    theme_bw(base_size = 11) +
+    theme(
+      strip.background = element_rect(fill = "#F0F0F0"),
+      axis.text.y      = element_text(size = 9)
+    )
+)
+dev.off()
+
+# emapplot requires pairwise term similarity
+pdf("../Report/gsea_emapplot_BP.pdf", width = 10, height = 10)
+print(emapplot(pairwise_termsim(gse_gbm), showCategory = 15))
+dev.off()
+
+# =============================================================================
+# 16. Venn diagram: ORA (top 100, no FDR) vs GSEA (top 100, no FDR)
+# =============================================================================
+#
+# Both sets are GO Biological Process terms ranked by raw p-value.
+# ORA is the enrichment on the final Elastic Net gene panel (ans.go3,
+# computed in section 10). GSEA is the seed=1 BP run above.
+#
+# "Top 100" is defined as the 100 terms with the smallest raw p-value in
+# each analysis, without any FDR or adjusted-p filter.
+# =============================================================================
+
+n_top = 100
+
+# ORA: ans.go3 was computed with pvalueCutoff = 1 so all terms are present
+ora_results_sorted = ans.go3@result[order(ans.go3@result$pvalue), ]
+ora_top = head(ora_results_sorted$Description, n_top)
+
+# GSEA: gse_gbm also has pvalueCutoff = 1
+gsea_results_sorted = gse_gbm@result[order(gse_gbm@result$pvalue), ]
+gsea_top = head(gsea_results_sorted$Description, n_top)
+
+n_overlap = length(intersect(ora_top, gsea_top))
+cat(sprintf(
+  "\nGO BP Venn summary (top %d by raw p-value):\n  ORA terms:  %d\n  GSEA terms: %d\n  Overlap:    %d\n",
+  n_top, length(ora_top), length(gsea_top), n_overlap
+))
+
+# Palette consistent with the three-way Venn in section 12
+venn_pal = c("#4477AA", "#EE6677")
+
+pdf("../Report/GO_BP_venn_ORA_vs_GSEA.pdf", width = 6, height = 6)
+venn_obj = venn.diagram(
+  x          = list(
+    `ORA`  = ora_top,
+    `GSEA` = gsea_top
+  ),
+  filename        = NULL,
+  fill            = venn_pal,
+  alpha           = 0.45,
+  col             = venn_pal,
+  lwd             = 1.8,
+  fontfamily      = "sans",
+  cat.fontfamily  = "sans",
+  cat.fontface    = "bold",
+  cat.cex         = 1.15,
+  cex             = 1.4,
+  margin          = 0.12,
+  main            = sprintf("GO BP top %d pathways: ORA vs GSEA", n_top),
+  main.fontfamily = "sans",
+  main.cex        = 1.15,
+  main.fontface   = "bold"
+)
+grid.newpage()
+grid.draw(venn_obj)
+dev.off()
+
+# Save the overlapping pathway names
+shared_ora_gsea = intersect(ora_top, gsea_top)
+if (length(shared_ora_gsea) > 0) {
+  write.xlsx(
+    data.frame(
+      Pathway         = shared_ora_gsea,
+      ORA_pvalue      = ora_results_sorted$pvalue[
+        match(shared_ora_gsea, ora_results_sorted$Description)],
+      ORA_padj        = ora_results_sorted$p.adjust[
+        match(shared_ora_gsea, ora_results_sorted$Description)],
+      GSEA_pvalue     = gsea_results_sorted$pvalue[
+        match(shared_ora_gsea, gsea_results_sorted$Description)],
+      GSEA_padj       = gsea_results_sorted$p.adjust[
+        match(shared_ora_gsea, gsea_results_sorted$Description)],
+      GSEA_NES        = gsea_results_sorted$NES[
+        match(shared_ora_gsea, gsea_results_sorted$Description)]
+    ),
+    file = "GO_BP_shared_ORA_GSEA_top100.xlsx"
+  )
+}
+
